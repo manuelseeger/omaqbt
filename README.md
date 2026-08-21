@@ -1,5 +1,7 @@
 # OmaqBT
 
+> **Upstream:** OmaqBT was created and is developed at [Aweiward/omaqbt](https://github.com/Aweiward/omaqbt). This repository is a downstream fork that carries remote Web API support while syncing compatible upstream changes.
+
 OmaqBT is an [Omarchy](https://omarchy.org) Quattro bar widget for controlling qBittorrent through its Web API. The bar shows live download/upload rates; the panel lists transfers, adds magnets, URLs, and `.torrent` files, controls torrent state, and edits file priorities and transfer limits.
 
 This fork is maintained by [Manuel Seeger](https://github.com/manuelseeger) at [manuelseeger/omaqbt](https://github.com/manuelseeger/omaqbt). Upstream MIT attribution remains in [LICENSE](LICENSE).
@@ -81,6 +83,8 @@ qBittorrent defines HTTP 403 from `/api/v2/auth/login` as a temporary client-IP 
 
 While a torrent is downloading or seeding, compact download/upload rates appear beside the bar mark on horizontal bars. Hover for exact rates. When a download reaches 100% between polls, OmaqBT sends a desktop notification through `notify-send`. Already-finished torrents are not re-notified after a shell restart.
 
+Clicking a `magnet:` link in a browser opens the panel after the browser's external-handler prompt. OmaqBT queues the link locally, adds it to the configured remote qBittorrent instance until metadata is available, then stops it. The confirmation row shows the resolved name and size when available; Enter starts the torrent, while Esc cancels it and deletes its files. Paste, `y`, and drag-and-drop behavior is unchanged.
+
 List keys:
 
 - `j` / `k`: move.
@@ -124,6 +128,7 @@ Expose a qBittorrent Web API only through an intentional reverse-proxy and netwo
 - Every request sends the normalized endpoint as its `Referer`, plus a private curl cookie jar. A protected API 403 triggers at most one login and one replay.
 - Session cookies and qBittorrent sync RID data live under `$XDG_RUNTIME_DIR/omaqbt/connections/<key>/`, where `<key>` is SHA-256 of the normalized endpoint, a NUL separator, and the username. The fallback is `/tmp/omaqbt-<uid>` when `XDG_RUNTIME_DIR` is unavailable.
 - Runtime directories are private and ownership-checked. Symlinked state directories/files are rejected. Cookie and RID files are not shared across endpoints or usernames.
+- Pending browser magnets live under `${XDG_STATE_HOME:-$HOME/.local/state}/omaqbt/`, separate from connection cookies and sync state.
 - Helper and UI errors redact cookie, SID, login, and password-like content before display. Endpoint-controlled text is rendered as plain text.
 
 ## Requirements
@@ -133,11 +138,20 @@ Expose a qBittorrent Web API only through an intentional reverse-proxy and netwo
 - On `PATH` for the helper: `curl`, `jq`, `python3`, and `sha256sum`.
 - `secret-tool` / libsecret only for authenticated endpoints.
 - `notify-send` / libnotify for completion notifications; missing notification support is ignored.
+- `xdg-mime` for browser `magnet:` handler registration.
 - `wl-paste` for clipboard add support.
 
 No local `qbittorrent`, `qbittorrent-nox`, systemd user service, VPN interface, or local qBittorrent profile is required or managed.
 
 ## Remove
+
+Restore the previous `magnet:` handler before removing the plugin:
+
+```sh
+./qbt magnet-uninstall-handler
+```
+
+Run that command from the plugin checkout. It removes `~/.local/share/applications/omaqbt-magnet.desktop` and restores `org.qbittorrent.qBittorrent.desktop` when the Qt qBittorrent application is installed.
 
 ```sh
 omarchy plugin remove omaqbt.remote
@@ -150,6 +164,7 @@ Removing the plugin disables the widget and deletes its checkout. It does not ch
 ```sh
 npm test
 ./tests/api-contract.sh
+./tests/magnet-handler.sh
 omarchy plugin validate .
 ```
 

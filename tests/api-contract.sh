@@ -310,7 +310,6 @@ try:
     symlinked = qbt("status", extra_env={"QBT_STATE_DIR": str(linked_state)})
     assert symlinked.returncode != 0
     assert "refusing symlinked state dir" in symlinked.stderr
-
 finally:
     server.terminate()
     server.wait(timeout=5)

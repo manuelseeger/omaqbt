@@ -4,7 +4,7 @@ import os
 from http import cookies
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote_plus, urlparse
 
 ROOT = Path(__file__).resolve().parent
 LOG = Path(os.environ["QBT_FIXTURE_LOG"])
@@ -14,6 +14,7 @@ FILES = json.loads((ROOT / "files.json").read_text())
 USERNAME = os.environ.get("QBT_FIXTURE_USERNAME", "admin")
 PASSWORD = os.environ.get("QBT_FIXTURE_PASSWORD", "fixture-password")
 COOKIE_NAME = os.environ.get("QBT_FIXTURE_COOKIE_NAME", "QBT_SID_8080")
+ADDED = []
 
 
 def current_sid():
@@ -108,6 +109,23 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v2/app/version":
             self._send(200, b"5.2.0", "text/plain")
             return
+        if parsed.path == "/api/v2/torrents/info":
+            rows = []
+            for h, t in FULL["torrents"].items():
+                row = dict(t)
+                hid = h or t.get("infohash_v1") or ""
+                row["hash"] = hid
+                rows.append(row)
+            rows.extend(ADDED)
+            self._send(200, json.dumps(rows).encode())
+            return
+        if parsed.path == "/api/v2/app/preferences":
+            bind = ""
+            bind_file = os.environ.get("QBT_FIXTURE_BIND_FILE")
+            if bind_file and Path(bind_file).exists():
+                bind = Path(bind_file).read_text().strip()
+            self._send(200, json.dumps({"current_network_interface": bind}).encode())
+            return
         self._send(404, b"{}")
 
     def do_POST(self):
@@ -134,8 +152,17 @@ class Handler(BaseHTTPRequestHandler):
         if not authorized or protected_forbidden():
             self._forbidden()
             return
+        if parsed.path == "/api/v2/torrents/add":
+            import re
+            fields = parse_qs(body, keep_blank_values=True)
+            for url in fields.get("urls") or []:
+                match = re.search(r"xt=urn:btih:([A-Za-z0-9]+)", url, re.I)
+                if match and len(match.group(1)) == 40:
+                    info_hash = match.group(1).lower()
+                    ADDED.append({"hash": info_hash, "infohash_v1": info_hash, "name": info_hash, "size": 0})
+            self._send(200, b"Ok.", "text/plain")
+            return
         if parsed.path in (
-            "/api/v2/torrents/add",
             "/api/v2/torrents/start",
             "/api/v2/torrents/stop",
             "/api/v2/torrents/delete",
