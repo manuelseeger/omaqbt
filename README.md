@@ -1,5 +1,7 @@
 # OmaqBT
 
+> **Upstream:** OmaqBT was created and is developed at [Aweiward/omaqbt](https://github.com/Aweiward/omaqbt). This repository is a downstream fork that carries remote Web API support while syncing compatible upstream changes.
+
 OmaqBT is an [Omarchy](https://omarchy.org) Quattro bar widget for controlling qBittorrent through its Web API. The bar shows live download/upload rates; the panel lists transfers, adds magnets, URLs, and `.torrent` files, controls torrent state, and edits file priorities and transfer limits.
 
 This fork is maintained by [Manuel Seeger](https://github.com/manuelseeger) at [manuelseeger/omaqbt](https://github.com/manuelseeger/omaqbt). Upstream MIT attribution remains in [LICENSE](LICENSE).
