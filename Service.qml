@@ -7,21 +7,26 @@ Item {
   id: root
   property var settings: ({})
 
-  property bool installed: false
-  property bool daemon: false
-  property string lockHolder: "none"
   property bool api: false
   property bool altSpeed: false
   property real dlSpeed: 0
   property real upSpeed: 0
-  property string vpnIface: ""
-  property string bindIface: ""
   property var torrents: []
   property var files: []
   property string lastError: ""
   property string actionStatus: ""
   property string clipboardText: ""
+  property bool initialized: false
+  property string statusConnectionKey: ""
+  property string actionConnectionKey: ""
+  property string filesConnectionKey: ""
 
+  readonly property string baseUrl: {
+    var value = String(settings && settings.baseUrl != null ? settings.baseUrl : "").trim()
+    return value === "" ? "http://127.0.0.1:8080" : value
+  }
+  readonly property string username: String(settings && settings.username != null ? settings.username : "")
+  readonly property string connectionKey: baseUrl + "\u0000" + username
   readonly property int refreshIntervalSec: {
     var n = parseInt(String(settings && settings.refreshIntervalSec != null ? settings.refreshIntervalSec : 5), 10)
     if (!isFinite(n)) n = 5
@@ -30,35 +35,54 @@ Item {
     return n
   }
   readonly property string helperPath: {
-    var s = Qt.resolvedUrl("qbt").toString()
-    if (s.indexOf("file://") === 0) return decodeURIComponent(s.substring(7))
-    return s
+    var value = Qt.resolvedUrl("qbt").toString()
+    if (value.indexOf("file://") === 0) return decodeURIComponent(value.substring(7))
+    return value
   }
-  readonly property bool busy: statusProcess.running || actionProcess.running || filesProcess.running || installProcess.running || daemonProcess.running || clipProcess.running
-  readonly property bool ready: installed && daemon && lockHolder !== "gui" && api
+  readonly property bool busy: statusProcess.running || actionProcess.running || filesProcess.running || clipProcess.running
+  readonly property bool ready: api
   readonly property bool transferring: Model.anyActive(torrents)
-  readonly property bool vpnUnbound: Model.vpnUnbound({ daemon: daemon, api: api, vpnIface: vpnIface, bindIface: bindIface })
-  readonly property bool warning: !installed || !daemon || lockHolder === "gui" || !api || vpnUnbound
+  readonly property bool warning: !api
+
+  function helperCommand(name, args) {
+    var command = [helperPath, "--base-url", baseUrl, "--username", username, name]
+    var values = args || []
+    for (var i = 0; i < values.length; i++) command.push(String(values[i]))
+    return command
+  }
 
   function clearError() { lastError = "" }
+
+  function clearRemoteState() {
+    api = false
+    altSpeed = false
+    dlSpeed = 0
+    upSpeed = 0
+    torrents = []
+    files = []
+  }
+
+  function connectionChanged() {
+    clearRemoteState()
+    lastError = ""
+    actionStatus = ""
+    refresh()
+  }
 
   function applyStatus(raw) {
     var parsed = Model.parseStatusJson(raw)
     if (!parsed.ok) {
-      lastError = parsed.error || "Failed to read qBittorrent status"
+      clearRemoteState()
+      lastError = "Failed to read qBittorrent status"
       return
     }
-    var finished = Model.newlyCompleted(torrents, parsed.torrents)
-    installed = parsed.installed
-    daemon = parsed.daemon
-    lockHolder = parsed.lockHolder
+    var finished = parsed.api ? Model.newlyCompleted(torrents, parsed.torrents) : []
     api = parsed.api
-    altSpeed = parsed.altSpeed
-    dlSpeed = parsed.dlSpeed
-    upSpeed = parsed.upSpeed
-    vpnIface = parsed.vpnIface
-    bindIface = parsed.bindIface
-    torrents = parsed.torrents
+    altSpeed = parsed.api ? parsed.altSpeed : false
+    dlSpeed = parsed.api ? parsed.dlSpeed : 0
+    upSpeed = parsed.api ? parsed.upSpeed : 0
+    torrents = parsed.api ? parsed.torrents : []
+    if (!parsed.api) files = []
     lastError = Model.nextStatusError(parsed, lastError)
     if (finished.length > 0) notify(Model.completionText(finished))
   }
@@ -71,7 +95,8 @@ Item {
 
   function refresh() {
     if (statusProcess.running) return
-    statusProcess.command = [helperPath, "status"]
+    statusConnectionKey = connectionKey
+    statusProcess.command = helperCommand("status", [])
     statusProcess.running = true
   }
 
@@ -81,38 +106,33 @@ Item {
     clipProcess.running = true
   }
 
+  function runAction(name, args, status) {
+    if (actionProcess.running) return false
+    clearError()
+    actionStatus = status || ""
+    actionConnectionKey = connectionKey
+    actionProcess.command = helperCommand(name, args)
+    actionProcess.running = true
+    return true
+  }
+
   function addTarget(target, stopped, savePath) {
-    var t = String(target || "").trim()
-    if (!Model.isAddableTarget(t) || actionProcess.running) {
-      if (!Model.isAddableTarget(t)) lastError = "Paste a magnet, a .torrent URL, or a .torrent file path."
+    var value = String(target || "").trim()
+    if (!Model.isAddableTarget(value)) {
+      lastError = "Paste a magnet, a .torrent URL, or a .torrent file path."
       return
     }
-    clearError()
-    actionStatus = stopped ? "Adding torrent (stopped)…" : "Adding torrent…"
-    var cmd = [helperPath, "add"]
-    if (stopped) cmd.push("--stopped")
-    var dir = String(savePath || "").trim()
-    if (dir !== "") { cmd.push("--savepath"); cmd.push(dir) }
-    cmd.push(t)
-    actionProcess.command = cmd
-    actionProcess.running = true
+    var args = []
+    if (stopped) args.push("--stopped")
+    var directory = String(savePath || "").trim()
+    if (directory !== "") { args.push("--savepath"); args.push(directory) }
+    args.push(value)
+    runAction("add", args, stopped ? "Adding torrent (stopped)…" : "Adding torrent…")
   }
 
   function addUrl(url) { addTarget(url, false, "") }
-
-  function startHash(hash) {
-    if (actionProcess.running) return
-    clearError()
-    actionProcess.command = [helperPath, "start", hash]
-    actionProcess.running = true
-  }
-
-  function stopHash(hash) {
-    if (actionProcess.running) return
-    clearError()
-    actionProcess.command = [helperPath, "stop", hash]
-    actionProcess.running = true
-  }
+  function startHash(hash) { runAction("start", [hash], "") }
+  function stopHash(hash) { runAction("stop", [hash], "") }
 
   function toggleHash(hash) {
     var row = null
@@ -129,77 +149,31 @@ Item {
   }
 
   function deleteHash(hash, withFiles) {
-    if (actionProcess.running) return
-    clearError()
-    actionStatus = withFiles ? "Deleting torrent and files…" : "Removing torrent…"
-    if (withFiles) actionProcess.command = [helperPath, "delete", hash, "--files"]
-    else actionProcess.command = [helperPath, "delete", hash]
-    actionProcess.running = true
+    var args = [hash]
+    if (withFiles) args.push("--files")
+    runAction("delete", args, withFiles ? "Deleting torrent and files…" : "Removing torrent…")
   }
 
   function loadFiles(hash) {
     files = []
     if (filesProcess.running) return
-    filesProcess.command = [helperPath, "files", hash]
+    filesConnectionKey = connectionKey
+    filesProcess.command = helperCommand("files", [hash])
     filesProcess.running = true
   }
 
-  function setPrio(hash, index, prio) {
-    if (actionProcess.running) return
-    actionProcess.command = [helperPath, "prio", hash, String(index), String(prio)]
-    actionProcess.running = true
-  }
+  function setPrio(hash, index, prio) { runAction("prio", [hash, index, prio], "") }
+  function toggleTurtle() { runAction("turtle", [], "") }
+  function setLimit(hash, kind, bytes) { runAction("limit", [hash, kind, bytes], "") }
+  function toggleSequential(hash) { runAction("sequential", [hash], "") }
+  function setShareRatio(hash, ratio) { runAction("sharelimit", [hash, ratio], "") }
 
-  function toggleTurtle() {
-    if (actionProcess.running) return
-    clearError()
-    actionProcess.command = [helperPath, "turtle"]
-    actionProcess.running = true
+  onBaseUrlChanged: if (initialized) connectionChanged()
+  onUsernameChanged: if (initialized) connectionChanged()
+  Component.onCompleted: {
+    initialized = true
+    refresh()
   }
-
-  function setLimit(hash, kind, bytes) {
-    if (actionProcess.running) return
-    clearError()
-    actionProcess.command = [helperPath, "limit", hash, kind, String(bytes)]
-    actionProcess.running = true
-  }
-
-  function toggleSequential(hash) {
-    if (actionProcess.running) return
-    clearError()
-    actionProcess.command = [helperPath, "sequential", hash]
-    actionProcess.running = true
-  }
-
-  function setShareRatio(hash, ratio) {
-    if (actionProcess.running) return
-    clearError()
-    actionProcess.command = [helperPath, "sharelimit", hash, String(ratio)]
-    actionProcess.running = true
-  }
-
-  function openPath(path) {
-    var p = String(path || "")
-    if (p === "" || openProcess.running) return
-    openProcess.command = ["xdg-open", p]
-    openProcess.running = true
-  }
-
-  function installDaemon() {
-    clearError()
-    actionStatus = "Installing qbittorrent-nox…"
-    installProcess.command = [helperPath, "install"]
-    installProcess.running = true
-  }
-
-  function startDaemon() {
-    clearError()
-    actionStatus = "Starting qBittorrent daemon…"
-    daemonProcess.command = [helperPath, "start-daemon"]
-    daemonProcess.running = true
-  }
-
-  Component.onCompleted: refresh()
 
   Timer {
     interval: root.refreshIntervalSec * 1000
@@ -215,24 +189,23 @@ Item {
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     stderr: StdioCollector { id: statusErr; waitForEnd: true }
     onExited: function(exitCode) {
-      if (exitCode === 0) root.applyStatus(statusOut.text)
-      else root.lastError = Model.sanitizeError(statusErr.text || "qBittorrent is not reachable")
+      if (root.statusConnectionKey !== root.connectionKey) {
+        Qt.callLater(root.refresh)
+        return
+      }
+      if (exitCode === 0) {
+        root.applyStatus(statusOut.text)
+      } else {
+        root.clearRemoteState()
+        root.lastError = Model.sanitizeError(statusErr.text || "Remote Web API is not reachable")
+      }
     }
-  }
-
-  Process {
-    id: openProcess
-    running: false
-    command: []
-    // Best effort: the file manager owns any failure UI from here.
-    onExited: function() {}
   }
 
   Process {
     id: notifyProcess
     running: false
     command: []
-    // Best effort: a missing notify-send must not surface as a plugin error.
     onExited: function() {}
   }
 
@@ -252,6 +225,10 @@ Item {
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(exitCode) {
       root.actionStatus = ""
+      if (root.actionConnectionKey !== root.connectionKey) {
+        Qt.callLater(root.refresh)
+        return
+      }
       if (exitCode !== 0) {
         root.lastError = Model.sanitizeError(actionErr.text || actionOut.text || "qBittorrent command failed")
         return
@@ -267,43 +244,17 @@ Item {
     stdout: StdioCollector { id: filesOut; waitForEnd: true }
     stderr: StdioCollector { id: filesErr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (root.filesConnectionKey !== root.connectionKey) {
+        root.files = []
+        return
+      }
       if (exitCode !== 0) {
         root.lastError = Model.sanitizeError(filesErr.text || "Could not read files")
         root.files = []
         return
       }
       try { root.files = JSON.parse(String(filesOut.text || "[]")) }
-      catch (e) { root.files = [] }
-    }
-  }
-
-  Process {
-    id: installProcess
-    running: false
-    command: []
-    stdout: StdioCollector { id: installOut; waitForEnd: true }
-    stderr: StdioCollector { id: installErr; waitForEnd: true }
-    onExited: function(exitCode) {
-      root.actionStatus = ""
-      if (exitCode !== 0) {
-        root.lastError = Model.sanitizeError(installErr.text || "Install failed")
-        return
-      }
-      root.startDaemon()
-    }
-  }
-
-  Process {
-    id: daemonProcess
-    running: false
-    command: []
-    stdout: StdioCollector { id: daemonOut; waitForEnd: true }
-    stderr: StdioCollector { id: daemonErr; waitForEnd: true }
-    onExited: function(exitCode) {
-      root.actionStatus = ""
-      if (exitCode !== 0)
-        root.lastError = Model.sanitizeError(daemonErr.text || "Could not start qbittorrent-nox")
-      root.refresh()
+      catch (error) { root.files = [] }
     }
   }
 }

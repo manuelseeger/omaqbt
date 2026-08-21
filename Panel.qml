@@ -8,8 +8,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "aweiward.omaqbt"
-  ipcTarget: "aweiward.omaqbt"
+  moduleName: "omaqbt.remote"
+  ipcTarget: "omaqbt.remote"
   manageIpc: false
 
   property string focusSection: "header"
@@ -46,19 +46,18 @@ Panel {
     return null
   }
   readonly property bool headerHasCursor: cursorActive && focusSection === "header" && qbt.ready && view === "list"
-  readonly property bool detailHasFolder: detailTorrent !== null && detailTorrent.savePath !== ""
   readonly property string heroTitle: {
     if (view === "detail" && detailTorrent) return Model.plainText(detailTorrent.name)
     return "OmaqBT"
   }
   readonly property string heroMeta: {
+    if (qbt.actionStatus !== "") return Model.plainText(qbt.actionStatus)
+    var error = Model.sanitizeError(qbt.lastError)
+    if (error !== "") return error
     if (view === "detail" && detailTorrent) {
       return Model.formatPercent(detailTorrent.progress) + " · " + Model.formatRate(detailTorrent.dlSpeed) + " · " + Model.formatEta(detailTorrent.eta)
     }
-    if (!qbt.installed) return "qBittorrent-nox is not installed"
-    if (qbt.lockHolder === "gui") return "Close qBittorrent first"
-    if (!qbt.daemon) return "Daemon is not running"
-    if (!qbt.api) return "Web API is not reachable"
+    if (!qbt.api) return "Remote Web API is not reachable"
     var meta = Model.formatRate(qbt.dlSpeed) + " · " + Model.formatRate(qbt.upSpeed) + " · " + activeCount + " active"
     if (qbt.altSpeed) meta += " · turtle"
     if (sortMode !== "default") meta += " · " + Model.sortLabel(sortMode)
@@ -80,16 +79,12 @@ Panel {
   }
 
   function ensureCursor() {
-    if (!qbt.installed) { focusSection = "install"; return }
-    if (qbt.lockHolder === "gui") { focusSection = "lock"; return }
-    if (!qbt.daemon) { focusSection = "daemon"; return }
     if (view === "detail") {
-      if (focusSection !== "openFolder" && focusSection !== "remove" && focusSection !== "deleteFiles" && focusSection !== "files")
+      if (focusSection !== "remove" && focusSection !== "deleteFiles" && focusSection !== "files")
         focusSection = (qbt.files && qbt.files.length > 0) ? "files" : "remove"
       if (fileIndex >= qbt.files.length) fileIndex = Math.max(0, qbt.files.length - 1)
       return
     }
-    if (focusSection === "install" || focusSection === "daemon" || focusSection === "lock") focusSection = "header"
     if (rowIndex >= visibleTorrents.length) rowIndex = Math.max(0, visibleTorrents.length - 1)
     if (rowIndex < 0) rowIndex = 0
   }
@@ -132,9 +127,6 @@ Panel {
     closeDetail()
   }
 
-  function openFolder(row) {
-    if (row && row.savePath) qbt.openPath(row.savePath)
-  }
 
   function submitAdd(stopped) {
     if (!fieldAddable) return
@@ -156,13 +148,8 @@ Panel {
     ensureCursor()
     if (dy === 0) return
     if (view === "detail") {
-      if (focusSection === "openFolder") {
-        if (dy > 0) focusSection = "remove"
-        return
-      }
       if (focusSection === "remove") {
-        if (dy < 0 && detailHasFolder) focusSection = "openFolder"
-        else if (dy > 0) focusSection = "deleteFiles"
+        if (dy > 0) focusSection = "deleteFiles"
         return
       }
       if (focusSection === "deleteFiles") {
@@ -202,13 +189,10 @@ Panel {
 
   function activateCursor() {
     ensureCursor()
-    if (focusSection === "install") qbt.installDaemon()
-    else if (focusSection === "daemon") qbt.startDaemon()
-    else if (focusSection === "header") qbt.toggleAll()
+    if (focusSection === "header") qbt.toggleAll()
     else if (focusSection === "clipboard") qbt.addUrl(qbt.clipboardText)
     else if (focusSection === "rows") openDetail(selectedTorrent)
     else if (focusSection === "files") cycleSelectedFile()
-    else if (focusSection === "openFolder") openFolder(detailTorrent)
     else if (focusSection === "remove") removeKeepFiles(detailHash)
     else if (focusSection === "deleteFiles") askDeleteFiles(detailHash)
   }
@@ -277,9 +261,6 @@ Panel {
       if (view === "list") sortMode = Model.cycleSort(sortMode)
     } else if (t === "z" || t === "Z") {
       if (qbt.ready) qbt.toggleTurtle()
-    } else if (t === "o" || t === "O") {
-      if (view === "detail") openFolder(detailTorrent)
-      else openFolder(selectedTorrent)
     }
   }
 
@@ -505,31 +486,6 @@ Panel {
               font.pixelSize: Style.font.bodySmall
             }
 
-            CursorSurface {
-              visible: root.detailHasFolder
-              width: parent.width
-              height: Style.space(36)
-              implicitHeight: height
-              hasCursor: root.cursorActive && root.focusSection === "openFolder"
-              foreground: root.foreground
-              fill: root.hoverFill
-              MouseArea {
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onEntered: { root.cursorActive = true; root.focusSection = "openFolder" }
-                onClicked: root.openFolder(root.detailTorrent)
-              }
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.left: parent.left
-                anchors.leftMargin: Style.space(10)
-                text: "Open folder"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-            }
 
             CursorSurface {
               width: parent.width
@@ -637,161 +593,7 @@ Panel {
             }
           }
 
-          Text {
-            visible: qbt.actionStatus !== "" || qbt.lastError !== ""
-            width: parent.width
-            text: qbt.actionStatus !== "" ? qbt.actionStatus : qbt.lastError
-            color: qbt.lastError !== "" && qbt.actionStatus === "" ? root.urgent : root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
 
-          CursorSurface {
-            visible: !qbt.installed
-            width: parent.width
-            implicitHeight: installCol.implicitHeight + Style.spacing.rowPaddingX
-            hasCursor: root.cursorActive && root.focusSection === "install"
-            foreground: root.foreground
-            fill: root.hoverFill
-            MouseArea {
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: qbt.busy ? Qt.ArrowCursor : Qt.PointingHandCursor
-              enabled: !qbt.busy
-              onEntered: { root.cursorActive = true; root.focusSection = "install" }
-              onClicked: qbt.installDaemon()
-            }
-            Column {
-              id: installCol
-              width: parent.width
-              spacing: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              leftPadding: Style.space(10)
-              rightPadding: Style.space(10)
-              Text {
-                width: parent.width - installCol.leftPadding - installCol.rightPadding
-                text: "qBittorrent-nox is not installed. Installs qbittorrent-nox from Arch extra. Leaves the desktop qBittorrent app alone."
-                color: root.dim
-                wrapMode: Text.WordWrap
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-              Text {
-                text: qbt.busy ? "Installing…" : "Install qBittorrent-nox"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-            }
-          }
-
-          CursorSurface {
-            visible: qbt.installed && qbt.lockHolder === "gui"
-            width: parent.width
-            implicitHeight: lockCol.implicitHeight + Style.spacing.rowPaddingX
-            hasCursor: root.cursorActive && root.focusSection === "lock"
-            foreground: root.foreground
-            fill: root.hoverFill
-            MouseArea {
-              anchors.fill: parent
-              hoverEnabled: true
-              onEntered: { root.cursorActive = true; root.focusSection = "lock" }
-            }
-            Column {
-              id: lockCol
-              width: parent.width
-              spacing: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              leftPadding: Style.space(10)
-              rightPadding: Style.space(10)
-              Text {
-                width: parent.width - lockCol.leftPadding - lockCol.rightPadding
-                text: "Close qBittorrent before starting the daemon."
-                color: root.dim
-                wrapMode: Text.WordWrap
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-            }
-          }
-
-          CursorSurface {
-            visible: qbt.installed && !qbt.daemon && qbt.lockHolder !== "gui"
-            width: parent.width
-            implicitHeight: daemonCol.implicitHeight + Style.spacing.rowPaddingX
-            hasCursor: root.cursorActive && root.focusSection === "daemon"
-            foreground: root.foreground
-            fill: root.hoverFill
-            MouseArea {
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: qbt.busy ? Qt.ArrowCursor : Qt.PointingHandCursor
-              enabled: !qbt.busy
-              onEntered: { root.cursorActive = true; root.focusSection = "daemon" }
-              onClicked: qbt.startDaemon()
-            }
-            Column {
-              id: daemonCol
-              width: parent.width
-              spacing: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              leftPadding: Style.space(10)
-              rightPadding: Style.space(10)
-              Text {
-                width: parent.width - daemonCol.leftPadding - daemonCol.rightPadding
-                text: "qBittorrent daemon is not running"
-                color: root.dim
-                wrapMode: Text.WordWrap
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-              Text {
-                text: qbt.busy ? "Starting…" : "Start daemon"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-            }
-          }
-
-          CursorSurface {
-            visible: qbt.vpnUnbound
-            width: parent.width
-            implicitHeight: vpnCol.implicitHeight + Style.spacing.rowPaddingX
-            hasCursor: false
-            foreground: root.urgent
-            fill: root.hoverFill
-            MouseArea {
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: qbt.busy ? Qt.ArrowCursor : Qt.PointingHandCursor
-              enabled: !qbt.busy
-              onClicked: qbt.startDaemon()
-            }
-            Column {
-              id: vpnCol
-              width: parent.width
-              spacing: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              leftPadding: Style.space(10)
-              rightPadding: Style.space(10)
-              Text {
-                width: parent.width - vpnCol.leftPadding - vpnCol.rightPadding
-                text: "VPN is up but qBittorrent is not bound to " + qbt.vpnIface + ". If the VPN drops, transfers keep going outside it."
-                color: root.dim
-                wrapMode: Text.WordWrap
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-              Text {
-                text: qbt.busy ? "Restarting…" : "Restart daemon to bind"
-                color: root.urgent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-            }
-          }
 
           Column {
             visible: qbt.ready && root.view === "list"

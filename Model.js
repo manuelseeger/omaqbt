@@ -198,13 +198,6 @@ function ratioLimitLabel(ratio) {
   return n.toFixed(1);
 }
 
-function vpnUnbound(status) {
-  var s = status || {};
-  if (s.daemon !== true || s.api !== true) return false;
-  var vpn = String(s.vpnIface || "");
-  if (vpn === "") return false;
-  return String(s.bindIface || "") !== vpn;
-}
 
 function formatEta(seconds) {
   var n = Number(seconds);
@@ -266,16 +259,11 @@ function cyclePriority(value) {
 function emptyStatus() {
   return {
     ok: false,
-    installed: false,
-    daemon: false,
-    lockHolder: "none",
     api: false,
     altSpeed: false,
     dlSpeed: 0,
     upSpeed: 0,
     torrents: [],
-    vpnIface: "",
-    bindIface: "",
     error: ""
   };
 }
@@ -315,41 +303,34 @@ function parseStatusJson(raw) {
       bucket: classifyState(row.state, row.progress)
     });
   }
+  var api = parsed.api === true;
   return {
     ok: true,
-    installed: parsed.installed === true,
-    daemon: parsed.daemon === true,
-    lockHolder: String(parsed.lockHolder || "none"),
-    api: parsed.api === true,
-    altSpeed: parsed.altSpeed === true,
-    dlSpeed: Number(parsed.dlSpeed || 0),
-    upSpeed: Number(parsed.upSpeed || 0),
-    torrents: torrents,
-    vpnIface: String(parsed.vpnIface || ""),
-    bindIface: String(parsed.bindIface || ""),
-    error: String(parsed.error || "")
+    api: api,
+    altSpeed: api && parsed.altSpeed === true,
+    dlSpeed: api ? Number(parsed.dlSpeed || 0) : 0,
+    upSpeed: api ? Number(parsed.upSpeed || 0) : 0,
+    torrents: api ? torrents : [],
+    error: sanitizeError(parsed.error || "")
   };
 }
 
 function sanitizeError(raw) {
-  return String(raw || "")
-    .replace(/SID=[^;\s]*/gi, "")
-    .replace(/password=[^;\s]*/gi, "")
+  return plainText(String(raw || "")
+    .replace(/(?:Set-Cookie:|Cookie:)[^\r\n]*/gi, "")
+    .replace(/SID[=:][^;,&\s"]*/gi, "")
+    .replace(/((?:username|password|passwd|pwd)"?\s*[:=]\s*"?)[^&;,"\s]+/gi, "$1<redacted>")
     .replace(/[ \t]{2,}/g, " ")
-    .trim();
+    .trim());
 }
 
 function nextStatusError(parsed, current) {
   var status = parsed || {};
-  if (status.error) return String(status.error);
-  if (status.ok && status.installed && status.daemon && status.api) return "";
-  return String(current || "");
+  if (status.error) return sanitizeError(status.error);
+  if (status.ok && status.api) return "";
+  return sanitizeError(current || "");
 }
 
-function installCommand(stdinIsTty) {
-  if (stdinIsTty) return ["omarchy", "pkg", "add", "qbittorrent-nox"];
-  return ["pkexec", "omarchy", "pkg", "add", "qbittorrent-nox"];
-}
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
@@ -363,7 +344,6 @@ if (typeof module !== "undefined" && module.exports) {
     barSpeedText: barSpeedText,
     newlyCompleted: newlyCompleted,
     completionText: completionText,
-    vpnUnbound: vpnUnbound,
     sortTorrents: sortTorrents,
     cycleSort: cycleSort,
     sortLabel: sortLabel,
@@ -385,7 +365,6 @@ if (typeof module !== "undefined" && module.exports) {
     parseStatusJson: parseStatusJson,
     sanitizeError: sanitizeError,
     nextStatusError: nextStatusError,
-    installCommand: installCommand
   };
 }
 

@@ -1,10 +1,8 @@
 # OmaqBT
 
-A themed [Omarchy](https://omarchy.org) Quattro bar widget for qBittorrent. The mark shows live ↓/↑ speeds while anything is transferring, and a desktop notification fires when a download finishes. Left-click the mark to watch live transfers, add a magnet or a `.torrent` file, start or stop, remove a torrent, and set file priorities. Right-click starts or stops everything. The official Qt window stays as an escape hatch.
+OmaqBT is an [Omarchy](https://omarchy.org) Quattro bar widget for controlling qBittorrent through its Web API. The bar shows live download/upload rates; the panel lists transfers, adds magnets, URLs, and `.torrent` files, controls torrent state, and edits file priorities and transfer limits.
 
-OmaqBT talks to `qbittorrent-nox` on your existing `~/.config/qBittorrent` library through the local Web API. It does not talk to any host other than `127.0.0.1`.
-
-License: [MIT](LICENSE).
+This fork is maintained by [Manuel Seeger](https://github.com/manuelseeger) at [manuelseeger/omaqbt](https://github.com/manuelseeger/omaqbt). Upstream MIT attribution remains in [LICENSE](LICENSE).
 
 ![OmaqBT on the Omarchy bar](preview.png)
 
@@ -13,110 +11,146 @@ License: [MIT](LICENSE).
 ## Install
 
 ```sh
-omarchy plugin add https://github.com/Aweiward/omaqbt.git --enable
+omarchy plugin add https://github.com/manuelseeger/omaqbt.git --enable
+omarchy bar move omaqbt.remote --section right
 ```
 
-If `qbittorrent-nox` is missing, open the widget and click **Install qBittorrent-nox**. That runs `pkexec omarchy pkg add qbittorrent-nox` (Arch extra, polkit password prompt) and then starts the user service `omaqbt-nox.service`. It will not remove desktop `qbittorrent` if you already have it.
+The plugin uses ID `omaqbt.remote`, so it does not collide with an upstream checkout.
 
-Close the Qt qBittorrent window before starting the daemon. Stop the daemon before opening the Qt app. They share one profile and must not run at the same time.
+OmaqBT does not install or run qBittorrent. The qBittorrent Web API must already be reachable from this workstation.
 
-Connect Mullvad before you start the daemon if you want traffic bound to the VPN. The bind only happens when `wg0-mullvad` is already up. If nox starts with Mullvad down, it stays unbound until the next start.
+## Configure the endpoint
 
-```sh
-omarchy bar move aweiward.omaqbt --section right
+The widget accepts these settings:
+
+- `baseUrl`: qBittorrent Web API base URL. Default: `http://127.0.0.1:8080`.
+- `username`: qBittorrent Web UI username. Default: empty, suitable for an unauthenticated localhost API.
+- `refreshIntervalSec`: fallback polling interval from 5 to 3600 seconds. Default: `5`.
+
+Set them on the widget entry in `~/.config/omarchy/shell.json`:
+
+```json
+{
+  "baseUrl": "https://torrent.example.net",
+  "username": "admin",
+  "refreshIntervalSec": 5
+}
 ```
+
+Restart or reload the Omarchy shell after editing its configuration. Changing `baseUrl` or `username` while the shell is running clears the previous transfer state and triggers an immediate connection probe.
+
+### URL security
+
+Remote endpoints must use HTTPS. Plain HTTP is accepted only for `127.0.0.1`, `localhost`, and `[::1]`. URLs containing user information, a query string, a fragment, an unsupported scheme, an empty host, or control characters are rejected before any credential lookup or network request.
+
+TLS certificate and hostname verification are always enabled. There is no insecure-TLS setting or fallback.
+
+## Provision authentication
+
+When `username` is non-empty and qBittorrent requests authentication, OmaqBT reads the password from Secret Service through `secret-tool`. Store the password for the exact normalized endpoint and username:
+
+```bash
+secret-tool store \
+  --label='OmaqBT qBittorrent password' \
+  application omaqbt.remote \
+  endpoint https://torrent.example.net \
+  username admin
+```
+
+`secret-tool` prompts for the password. Do not add a password argument, shell variable, environment variable, or `shell.json` field.
+
+Remove that credential with:
+
+```bash
+secret-tool clear \
+  application omaqbt.remote \
+  endpoint https://torrent.example.net \
+  username admin
+```
+
+`secret-tool` is provided by libsecret. It is required only when the configured endpoint requires authentication. An unauthenticated loopback API does not need it.
+
+qBittorrent defines HTTP 403 from `/api/v2/auth/login` as a temporary client-IP ban after too many failed login attempts. Wait for qBittorrent's configured ban duration or have an administrator restart the service or clear the banned IP. OmaqBT does not submit a login request when the matching Secret Service entry is absent.
 
 ## Usage
 
-- Left click: open or close the panel
-- Right click: start or stop all torrents
-- Middle click: refresh
-- Esc: close the panel
+- Left click: open or close the panel.
+- Right click: start or stop all torrents.
+- Middle click: refresh.
+- Esc: close the panel.
 
-While a torrent is downloading or seeding, compact ↓/↑ speeds appear next to the bar mark (horizontal bars only; hover for exact rates). When a download reaches 100% between two polls, a desktop notification fires through `notify-send`. Already-finished torrents never re-notify, including on shell restart.
+While a torrent is downloading or seeding, compact download/upload rates appear beside the bar mark on horizontal bars. Hover for exact rates. When a download reaches 100% between polls, OmaqBT sends a desktop notification through `notify-send`. Already-finished torrents are not re-notified after a shell restart.
 
-If Mullvad (or `QBT_BIND_IFACE`) is up but the running daemon is not bound to it, the mark shows the warning badge and the panel offers **Restart daemon to bind**. Restarting writes the bind keys and brings the daemon back on the tunnel.
+List keys:
 
-List keys: `j`/`k` move, Enter opens files, Space start/stop, `o` open the save folder, `x` remove (keep files), `X` delete files, `t` start/stop all, `s` cycle sort (default → speed → eta → added), `z` turtle mode, `a`/`p`/`c`/`*` filter, `/` magnet field, `y` add clipboard magnet, `r` refresh.
+- `j` / `k`: move.
+- Enter: open torrent detail.
+- Space: start or stop the selected torrent.
+- `x`: remove the selected torrent while keeping its files; in file detail, skip the selected file.
+- `X`: remove the torrent and delete its files after confirmation.
+- `t`: start or stop all torrents.
+- `s`: cycle sort order.
+- `z`: toggle alternative speed limits (turtle mode).
+- `a` / `p` / `c` / `*`: active, paused, completed, or all filters.
+- `/`: focus the add field.
+- `y`: add a magnet or `.torrent` target from the clipboard.
+- `r`: refresh.
+- Backspace or `h`: leave torrent detail.
 
-The field takes a magnet, a `.torrent` URL, or a local `.torrent` path (`/…`, `~/…`, or `file://…`). Once it holds something addable, a **Save to…** field and an **Add stopped** row appear: Enter adds and starts, Add stopped adds without starting, and the save path overrides qBittorrent’s default when filled. Dropping a `.torrent` file or magnet link onto the open panel adds it too. From a terminal, `qbt add` also accepts `--category <name>`.
+File view keys: `j` / `k` move, Enter cycles priority, `x` skips a file, Space starts or stops the torrent, and `X` deletes the torrent and its files.
 
-Typing anything that is not addable filters the list by name; Esc clears the filter first, then closes.
+The add field accepts:
 
-File view keys: `j`/`k` move, Enter cycle priority, `x` skip, Space start/stop, `X` delete files, Backspace or `h` back.
+- A magnet link.
+- An HTTP(S) URL ending in `.torrent`.
+- A local `.torrent` path (`/…`, `~/…`, or `file://…`).
 
-**Turtle mode** (`z`, or the row in the list) toggles qBittorrent’s alternative speed limits; the header shows “turtle” while it is on. Configure the alternative rates themselves in qBittorrent.
+Selecting a local `.torrent` uploads that file to the remote qBittorrent daemon. The optional **Save to…** value is also interpreted by the remote daemon. Enter adds and starts; **Add stopped** adds without starting. Dropping a `.torrent` file or magnet link onto the open panel also adds it.
 
-On a torrent’s detail view, size, ratio, seeds/peers, the added date, and the save path sit under the title, followed by **Open folder**, **Remove, keep files** and **Delete files**. Below the file list controls, clickable rows cycle the per-torrent download/upload limit (∞ → 8M → 4M → 1M → 256K), toggle sequential download, and cycle the seed ratio limit (global → 1.0 → 2.0 → none). Open folder (`o`) opens the save path in your file manager. Remove takes it out of the list and leaves the download on disk. Delete asks first, then removes the torrent and its files.
+Torrent detail shows size, ratio, seeds/peers, added time, and `savePath`. The path describes the remote daemon's filesystem. OmaqBT displays it as plain text and intentionally provides no **Open folder** action or shortcut because that remote path generally does not exist on this workstation.
 
-## Configure
+Remote-safe controls remain available: add, start/stop, remove, delete files, per-file priorities, alternative speed mode, per-torrent download/upload limits, sequential download, and share-ratio limits.
 
-The only plugin setting is `refreshIntervalSec` (default 5) on the widget entry in `~/.config/omarchy/shell.json`.
+## Network access
 
-Starting the daemon writes these keys under `[Preferences]` in `~/.config/qBittorrent/qBittorrent.conf` if you click **Install** or **Start daemon**:
+Expose a qBittorrent Web API only through an intentional reverse-proxy and network-access policy. Restrict clients to the required private networks and do not expose the Web API publicly.
 
-```
-WebUI\Enabled=true
-WebUI\Address=127.0.0.1
-WebUI\LocalHostAuth=false
-WebUI\AuthSubnetWhitelistEnabled=true
-WebUI\AuthSubnetWhitelist=127.0.0.1, ::1
-WebUI\Port=<existing port, or 8080>
-```
+## Architecture and security model
 
-If `wg0-mullvad` is present (or `QBT_BIND_IFACE` is set), starting the daemon also writes under `[BitTorrent]`:
+- `Panel.qml` renders remote transfer state and invokes `Service.qml` operations.
+- `Service.qml` passes `baseUrl` and `username` to every helper invocation. Settings changes clear stale data before probing the new connection.
+- `qbt` validates and normalizes the base URL, authenticates when a protected request returns HTTP 403, and calls qBittorrent API v2.
+- The password remains in Secret Service. `qbt` confirms that lookup succeeded, then pipes the password from `secret-tool` to curl over standard input; it is never placed in plugin configuration, command arguments, process environment, repository files, logs, or error messages. A missing secret never causes an empty-password login attempt.
+- Every request sends the normalized endpoint as its `Referer`, plus a private curl cookie jar. A protected API 403 triggers at most one login and one replay.
+- Session cookies and qBittorrent sync RID data live under `$XDG_RUNTIME_DIR/omaqbt/connections/<key>/`, where `<key>` is SHA-256 of the normalized endpoint, a NUL separator, and the username. The fallback is `/tmp/omaqbt-<uid>` when `XDG_RUNTIME_DIR` is unavailable.
+- Runtime directories are private and ownership-checked. Symlinked state directories/files are rejected. Cookie and RID files are not shared across endpoints or usernames.
+- Helper and UI errors redact cookie, SID, login, and password-like content before display. Endpoint-controlled text is rendered as plain text.
 
-```
-Session\Interface=<iface>
-Session\InterfaceName=<iface>
-Session\InterfaceAddress=
-```
+## Requirements
 
-That binds the tunnel interface, not a single relay IP, so a Mullvad city change does not stall announces.
+- Omarchy 4 (Quattro) / `omarchy-shell`.
+- A reachable qBittorrent Web API v2 endpoint.
+- On `PATH` for the helper: `curl`, `jq`, `python3`, and `sha256sum`.
+- `secret-tool` / libsecret only for authenticated endpoints.
+- `notify-send` / libnotify for completion notifications; missing notification support is ignored.
+- `wl-paste` for clipboard add support.
 
-No other qBittorrent keys are rewritten. The plugin never stores a Web UI password.
+No local `qbittorrent`, `qbittorrent-nox`, systemd user service, VPN interface, or local qBittorrent profile is required or managed.
 
 ## Remove
 
 ```sh
-omarchy plugin remove aweiward.omaqbt
+omarchy plugin remove omaqbt.remote
 ```
 
-That disables the widget and deletes the plugin checkout. It does **not** uninstall `qbittorrent-nox`, stop `omaqbt-nox.service`, delete torrents, or revert the Web UI keys above.
+Removing the plugin disables the widget and deletes its checkout. It does not change the remote qBittorrent daemon or remove the Secret Service entry; use `secret-tool clear` above when credential removal is intended.
 
-To stop the daemon yourself:
-
-```sh
-systemctl --user stop omaqbt-nox.service
-```
-
-## Requirements
-
-- Omarchy 4 (Quattro) / `omarchy-shell`
-- `qbittorrent-nox` 5.2+ (installed from the panel if missing)
-- On PATH for the helper: `curl`, `jq`, `python3`
-- `notify-send` (libnotify) for completion notifications; without it they are skipped silently
-- `xdg-open` (xdg-utils) for **Open folder**
-- `pkexec` only when installing the package from the panel (no TTY for `sudo`)
-- `systemctl --user` for `omaqbt-nox.service`
-
-## What this plugin does on your system
-
-- Runs `qbt` from the plugin folder. That helper is the only process that talks HTTP, and only to `127.0.0.1`.
-- Installs the Arch extra package `qbittorrent-nox` through `omarchy pkg add` when you click Install. Privilege is `pkexec`, not a sudoers rule.
-- Writes `~/.config/systemd/user/omaqbt-nox.service` and enables it as your user.
-- Writes the localhost Web UI keys listed under Configure. It stops the daemon first so qBittorrent does not overwrite those keys on exit.
-- If `wg0-mullvad` is up, also writes the `[BitTorrent]` interface keys so qBittorrent binds the tunnel, not a single relay IP.
-- Stores sync state in `$XDG_RUNTIME_DIR/omaqbt/` (private, mode 700). If that variable is unset it falls back to a uid-scoped `/tmp/omaqbt-<uid>`, created with `umask 077`, and refuses to write through a symlink or a directory it does not own.
-- Sends a desktop notification through `notify-send` when a download completes. Nothing else notifies.
-- Does not add torrents, delete files, or start the daemon unless you click or press the matching control.
-
-## Dev
+## Development
 
 ```sh
-node --test tests/*.test.js
-tests/api-contract.sh
+npm test
+./tests/api-contract.sh
 omarchy plugin validate .
 ```
 
-`tests/api-contract.sh` talks to a fixture HTTP server. It does not start `qbittorrent-nox`, add a real torrent, or delete files on disk.
+The API contract suite starts only loopback fixture servers. It never contacts a real qBittorrent instance, adds a real torrent, or mutates remote data.

@@ -1,22 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
-HOME_DIR="${QBT_HOME:-$HOME}"
-CONF="${QBT_CONF:-$HOME_DIR/.config/qBittorrent/qBittorrent.conf}"
-# Prefer the private per-user runtime dir (/run/user/UID, mode 0700). Only when
-# it is missing fall back to a uid-scoped /tmp path, never the shared /tmp/omaqbt
-# that any local user could pre-create as a symlink.
 if [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
   STATE_DIR="${QBT_STATE_DIR:-$XDG_RUNTIME_DIR/omaqbt}"
 else
   STATE_DIR="${QBT_STATE_DIR:-/tmp/omaqbt-$(id -u)}"
 fi
-RID_FILE="${QBT_RID_FILE:-$STATE_DIR/rid.json}"
-UNIT_DIR="$HOME_DIR/.config/systemd/user"
-UNIT_FILE="$UNIT_DIR/omaqbt-nox.service"
 
 sanitize() {
-  sed -E 's/SID=[^;[:space:]]*/SID=<redacted>/gi; s/password=[^;[:space:]]*/password=<redacted>/gi'
+  sed -E \
+    -e 's/(Set-Cookie:|Cookie:)[^\r\n]*/\1 <redacted>/gi' \
+    -e 's/SID[=:][^;,&[:space:]"]*/SID=<redacted>/gi' \
+    -e 's/((username|password|passwd|pwd)"?[[:space:]]*[:=][[:space:]]*"?)[^&;,"[:space:]]+/\1<redacted>/gi'
 }
 
 die() {
@@ -26,8 +22,7 @@ die() {
 
 ensure_state_dir() {
   local dir=$1
-  [[ -n $dir ]] || return 0
-  # A pre-planted symlink would redirect our write; refuse to follow it.
+  [[ -n $dir ]] || die "state directory is empty"
   if [[ -L $dir ]]; then
     die "refusing symlinked state dir: $dir"
   fi
@@ -39,229 +34,393 @@ ensure_state_dir() {
   if [[ -n $owner && $owner != "$(id -u)" ]]; then
     die "state dir not owned by current user: $dir"
   fi
+  chmod 700 "$dir" 2>/dev/null || die "cannot secure state dir: $dir"
 }
 
-read_port() {
-  local port=""
-  if [[ -f $CONF ]]; then
-    port=$(grep -E '^WebUI\\Port=' "$CONF" | tail -n1 | cut -d= -f2 || true)
+ensure_private_file() {
+  local file=$1
+  if [[ -L $file ]]; then
+    die "refusing symlinked state file: $file"
   fi
-  if [[ -z ${port:-} ]]; then
-    port=8080
-  fi
-  printf '%s' "$port"
-}
-
-base_url() {
-  if [[ -n ${QBT_BASE:-} ]]; then
-    printf '%s' "$QBT_BASE"
-    return
-  fi
-  printf 'http://127.0.0.1:%s' "$(read_port)"
-}
-
-assert_local_base() {
-  local base host
-  base=$(base_url)
-  host=$(printf '%s' "$base" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')
-  [[ $host == 127.0.0.1 ]] || die "refusing non-localhost host: $host"
-}
-
-lock_holder() {
-  if [[ -n ${QBT_LOCK:-} ]]; then
-    printf '%s' "$QBT_LOCK"
-    return
-  fi
-  if pgrep -x qbittorrent >/dev/null 2>&1; then
-    printf 'gui'
-  elif pgrep -x qbittorrent-nox >/dev/null 2>&1; then
-    printf 'nox'
+  if [[ -e $file ]]; then
+    local owner
+    owner=$(stat -c '%u' "$file" 2>/dev/null || printf '')
+    if [[ -n $owner && $owner != "$(id -u)" ]]; then
+      die "state file not owned by current user: $file"
+    fi
   else
-    printf 'none'
+    : >"$file"
+  fi
+  chmod 600 "$file" 2>/dev/null || die "cannot secure state file: $file"
+}
+
+BASE_INPUT="${QBT_BASE:-http://127.0.0.1:8080}"
+USERNAME="${QBT_USERNAME:-}"
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    --base-url)
+      [[ $# -ge 2 ]] || die "--base-url needs a value"
+      BASE_INPUT=$2
+      shift 2
+      ;;
+    --username)
+      [[ $# -ge 2 ]] || die "--username needs a value"
+      USERNAME=$2
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *) die "unknown global option: $1" ;;
+  esac
+done
+
+validation=""
+if ! validation=$(python3 - "$BASE_INPUT" <<'PY'
+import sys
+import unicodedata
+from urllib.parse import urlsplit, urlunsplit
+
+raw = sys.argv[1]
+if not raw:
+    raise SystemExit("the URL is empty")
+if any(ord(ch) < 32 or 127 <= ord(ch) <= 159 or unicodedata.category(ch) == "Cf" for ch in raw):
+    raise SystemExit("control characters are not allowed")
+if "?" in raw:
+    raise SystemExit("query strings are not allowed")
+if "#" in raw:
+    raise SystemExit("fragments are not allowed")
+try:
+    parsed = urlsplit(raw)
+    port = parsed.port
+except ValueError:
+    raise SystemExit("the host or port is invalid")
+scheme = parsed.scheme.lower()
+if scheme not in ("http", "https"):
+    raise SystemExit("only http and https are supported")
+if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+    raise SystemExit("userinfo is not allowed")
+host = parsed.hostname
+if not host or any(ch.isspace() for ch in host):
+    raise SystemExit("the host is empty or invalid")
+host = host.lower()
+if scheme == "http" and host not in ("127.0.0.1", "localhost", "::1"):
+    raise SystemExit("plain HTTP is allowed only for loopback endpoints")
+netloc = f"[{host}]" if ":" in host else host
+if port is not None:
+    netloc += f":{port}"
+path = parsed.path.rstrip("/")
+print(urlunsplit((scheme, netloc, path, "", "")))
+PY
+); then
+  die "invalid base URL: $validation"
+fi
+BASE_URL=$validation
+
+read -r CONNECTION_KEY _ < <(printf '%s\0%s' "$BASE_URL" "$USERNAME" | sha256sum)
+CONNECTIONS_DIR="$STATE_DIR/connections"
+CONNECTION_DIR="$CONNECTIONS_DIR/$CONNECTION_KEY"
+COOKIE_FILE="$CONNECTION_DIR/cookies.txt"
+RID_FILE="$CONNECTION_DIR/rid.json"
+ensure_state_dir "$STATE_DIR"
+ensure_state_dir "$CONNECTIONS_DIR"
+ensure_state_dir "$CONNECTION_DIR"
+ensure_private_file "$COOKIE_FILE"
+ensure_private_file "$RID_FILE"
+
+API_ERROR=""
+HTTP_CODE=""
+HTTP_BODY_FILE=""
+
+cleanup_response() {
+  if [[ -n ${HTTP_BODY_FILE:-} ]]; then
+    rm -f "$HTTP_BODY_FILE"
+    HTTP_BODY_FILE=""
   fi
 }
 
-vpn_iface() {
-  if [[ -n ${QBT_BIND_IFACE:-} ]]; then
-    printf '%s' "$QBT_BIND_IFACE"
-    return
+curl_once() {
+  local method=$1 path=$2 timeout=$3
+  shift 3
+  cleanup_response
+  HTTP_BODY_FILE=$(mktemp "$CONNECTION_DIR/response.XXXXXX")
+  local code_file error_file curl_status curl_detail
+  code_file=$(mktemp "$CONNECTION_DIR/code.XXXXXX")
+  error_file=$(mktemp "$CONNECTION_DIR/curl-error.XXXXXX")
+  set +e
+  curl -sS -g --max-time "$timeout" \
+    -X "$method" \
+    -b "$COOKIE_FILE" -c "$COOKIE_FILE" \
+    -H "Referer: $BASE_URL/" \
+    -o "$HTTP_BODY_FILE" -w '%{http_code}' \
+    "$BASE_URL$path" "$@" >"$code_file" 2>"$error_file"
+  curl_status=$?
+  set -e
+  HTTP_CODE=$(<"$code_file")
+  curl_detail=$(sanitize <"$error_file")
+  curl_detail=${curl_detail:0:300}
+  rm -f "$code_file" "$error_file"
+  if [[ $curl_status -ne 0 ]]; then
+    API_ERROR="TLS or transport failure while contacting qBittorrent"
+    [[ -n $curl_detail ]] && API_ERROR+=": $curl_detail"
+    cleanup_response
+    return 1
   fi
-  if [[ -d ${QBT_NET_DIR:-/sys/class/net}/wg0-mullvad ]]; then
-    printf 'wg0-mullvad'
-  fi
+  return 0
 }
 
-is_installed() {
-  if [[ -n ${QBT_INSTALLED:-} ]]; then
-    [[ $QBT_INSTALLED == 1 ]]
-    return
-  fi
-  command -v qbittorrent-nox >/dev/null 2>&1
+has_session_cookie() {
+  python3 - "$COOKIE_FILE" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+try:
+    lines = Path(sys.argv[1]).read_text(errors="replace").splitlines()
+except OSError:
+    raise SystemExit(1)
+for line in lines:
+    if line.startswith("#HttpOnly_"):
+        line = line[len("#HttpOnly_"):]
+    elif line.startswith("#"):
+        continue
+    fields = line.split("\t")
+    if len(fields) >= 7 and re.search(r"(^|_)sid(_|$)", fields[-2], re.I) and fields[-1]:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
-is_daemon() {
-  if [[ -n ${QBT_DAEMON:-} ]]; then
-    [[ $QBT_DAEMON == 1 ]]
-    return
+authenticate() {
+  if [[ -z $USERNAME ]]; then
+    API_ERROR="authentication required but no username is configured"
+    return 1
   fi
-  pgrep -x qbittorrent-nox >/dev/null 2>&1
+  if ! command -v secret-tool >/dev/null 2>&1; then
+    API_ERROR="authentication requires secret-tool (libsecret)"
+    return 1
+  fi
+
+  local coproc_fd secret_fd secret_pid secret_status
+  coproc OMAQBT_SECRET_LOOKUP {
+    secret-tool lookup \
+      application omaqbt.remote \
+      endpoint "$BASE_URL" \
+      username "$USERNAME" 2>/dev/null
+  }
+  coproc_fd=${OMAQBT_SECRET_LOOKUP[0]}
+  exec {secret_fd}<&"$coproc_fd"
+  secret_pid=$OMAQBT_SECRET_LOOKUP_PID
+  set +e
+  wait "$secret_pid"
+  secret_status=$?
+  set -e
+  if [[ $secret_status -ne 0 ]]; then
+    exec {secret_fd}<&-
+    API_ERROR="no Secret Service password exists for this endpoint and username"
+    return 1
+  fi
+
+  cleanup_response
+  HTTP_BODY_FILE=$(mktemp "$CONNECTION_DIR/login-response.XXXXXX")
+  local code_file error_file curl_status curl_detail
+  code_file=$(mktemp "$CONNECTION_DIR/login-code.XXXXXX")
+  error_file=$(mktemp "$CONNECTION_DIR/login-error.XXXXXX")
+  set +e
+  curl -sS -g --max-time 15 \
+    -X POST \
+    -b "$COOKIE_FILE" -c "$COOKIE_FILE" \
+    -H "Referer: $BASE_URL/" \
+    --data-urlencode "username=$USERNAME" \
+    --data-urlencode 'password@-' \
+    -o "$HTTP_BODY_FILE" -w '%{http_code}' \
+    "$BASE_URL/api/v2/auth/login" \
+    <&"$secret_fd" >"$code_file" 2>"$error_file"
+  curl_status=$?
+  set -e
+  exec {secret_fd}<&-
+  HTTP_CODE=$(<"$code_file")
+  curl_detail=$(sanitize <"$error_file")
+  curl_detail=${curl_detail:0:300}
+  rm -f "$code_file" "$error_file"
+
+  if [[ $curl_status -ne 0 ]]; then
+    API_ERROR="TLS or transport failure while authenticating to qBittorrent"
+    [[ -n $curl_detail ]] && API_ERROR+=": $curl_detail"
+    cleanup_response
+    return 1
+  fi
+  if [[ $HTTP_CODE == 403 ]]; then
+    API_ERROR="qBittorrent reports that this client IP is banned after too many failed login attempts (HTTP 403)"
+    cleanup_response
+    return 1
+  fi
+  if [[ $HTTP_CODE != 200 && $HTTP_CODE != 204 ]]; then
+    API_ERROR="qBittorrent login returned HTTP $HTTP_CODE"
+    cleanup_response
+    return 1
+  fi
+
+  local login_body
+  login_body=$(<"$HTTP_BODY_FILE")
+  cleanup_response
+  if [[ $HTTP_CODE == 200 && $login_body != "Ok." ]]; then
+    API_ERROR="qBittorrent rejected the stored credentials"
+    return 1
+  fi
+  if ! has_session_cookie; then
+    API_ERROR="qBittorrent login succeeded without returning a session cookie"
+    return 1
+  fi
+  return 0
 }
 
-api_exec() {
-  local tmp code
-  tmp=$(mktemp)
-  code=$(curl -o "$tmp" -w '%{http_code}' "$@" || true)
-  local resp
-  resp=$(cat "$tmp")
-  rm -f "$tmp"
-  if [[ $code == 403 ]]; then
-    die "localhost auth is required"
+api_request() {
+  local method=$1 path=$2 timeout=$3
+  shift 3
+  API_ERROR=""
+  if ! curl_once "$method" "$path" "$timeout" "$@"; then
+    return 1
   fi
-  if [[ $code != 200 && $code != 204 ]]; then
-    die "HTTP $code $(printf '%s' "$resp" | sanitize)"
+  if [[ $HTTP_CODE == 403 ]]; then
+    cleanup_response
+    if ! authenticate; then
+      return 1
+    fi
+    if ! curl_once "$method" "$path" "$timeout" "$@"; then
+      return 1
+    fi
+    if [[ $HTTP_CODE == 403 ]]; then
+      API_ERROR="authentication or proxy access was rejected after login (HTTP 403)"
+      cleanup_response
+      return 1
+    fi
   fi
-  printf '%s' "$resp"
+  if [[ $HTTP_CODE != 200 && $HTTP_CODE != 204 ]]; then
+    local response
+    response=$(sanitize <"$HTTP_BODY_FILE")
+    response=${response:0:500}
+    API_ERROR="qBittorrent API returned HTTP $HTTP_CODE"
+    [[ -n $response ]] && API_ERROR+=": $response"
+    cleanup_response
+    return 1
+  fi
+  return 0
 }
 
-api() {
-  assert_local_base
-  local method=$1 path=$2
-  local body=${3:-}
-  local url
-  url="$(base_url)$path"
-  local args=(-sS -g --max-time 5 -X "$method" "$url")
-  if [[ -n $body ]]; then
-    args+=(-H "Content-Type: application/x-www-form-urlencoded" --data "$body")
-  fi
-  api_exec "${args[@]}"
-}
-
-api_form() {
-  assert_local_base
-  local method=$1 path=$2
-  shift 2
-  api_exec -sS -g --max-time 30 -X "$method" "$(base_url)$path" "$@"
+print_status_error() {
+  local error
+  error=$(printf '%s' "$1" | sanitize)
+  jq -n --arg error "$error" \
+    '{api:false,error:$error,altSpeed:false,dlSpeed:0,upSpeed:0,torrents:[]}'
 }
 
 cmd_status() {
-  local installed=false daemon=false api=false alt_speed=false
-  local vpn_if bind_if=""
-  vpn_if=$(vpn_iface)
-  if is_installed; then installed=true; fi
-  if is_daemon; then daemon=true; fi
-  local lock
-  lock=$(lock_holder)
-  local torrents='[]' dl=0 up=0
-  if [[ $installed == true && $daemon == true && $lock != gui ]]; then
-    ensure_state_dir "$(dirname "$RID_FILE")"
-    local rid=0 cache='{}'
-    if [[ -f $RID_FILE ]]; then
-      rid=$(jq -r '.rid // 0' "$RID_FILE")
-      cache=$(jq -c '.torrents // {}' "$RID_FILE")
+  local rid=0
+  if [[ -s $RID_FILE ]]; then
+    if ! rid=$(jq -r '.rid // 0' "$RID_FILE" 2>/dev/null); then
+      rid=0
+      : >"$RID_FILE"
     fi
-    local raw ok
-    set +e
-    raw=$(api GET "/api/v2/sync/maindata?rid=${rid}")
-    ok=$?
-    set -e
-    if [[ $ok -eq 0 ]]; then
-      api=true
-      local merged
-      merged=$(CACHE="$cache" python3 -c '
-import json, os, sys
-raw = json.loads(sys.stdin.read() or "{}")
-cache = json.loads(os.environ["CACHE"] or "{}")
+  fi
+
+  if ! api_request GET "/api/v2/sync/maindata?rid=$rid" 5; then
+    print_status_error "$API_ERROR"
+    return 0
+  fi
+  local sync_response=$HTTP_BODY_FILE merged
+  HTTP_BODY_FILE=""
+  if ! merged=$(python3 - "$sync_response" "$RID_FILE" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+response_path = Path(sys.argv[1])
+rid_path = Path(sys.argv[2])
+raw = json.loads(response_path.read_text() or "{}")
+cache = {}
+if rid_path.exists() and rid_path.stat().st_size:
+    try:
+        cache = json.loads(rid_path.read_text() or "{}").get("torrents") or {}
+    except (OSError, ValueError, TypeError):
+        cache = {}
 if raw.get("full_update"):
     torrents = dict(raw.get("torrents") or {})
 else:
     torrents = dict(cache)
-    for k, v in (raw.get("torrents") or {}).items():
-        cur = dict(torrents.get(k) or {})
-        cur.update(v or {})
-        torrents[k] = cur
-    for k in raw.get("torrents_removed") or []:
-        torrents.pop(k, None)
+    for key, value in (raw.get("torrents") or {}).items():
+        current = dict(torrents.get(key) or {})
+        current.update(value or {})
+        torrents[key] = current
+    for key in raw.get("torrents_removed") or []:
+        torrents.pop(key, None)
 
 normalized = {}
-for key, t in torrents.items():
-    t = dict(t or {})
-    hid = t.get("hash") or t.get("infohash_v1") or t.get("infohash_v2") or key
-    t["hash"] = hid
-    normalized[str(hid)] = t
+for key, value in torrents.items():
+    torrent = dict(value or {})
+    info_hash = torrent.get("hash") or torrent.get("infohash_v1") or torrent.get("infohash_v2") or key
+    torrent["hash"] = info_hash
+    normalized[str(info_hash)] = torrent
 torrents = normalized
 
 rows = []
-for key, t in torrents.items():
+for key, torrent in torrents.items():
     rows.append({
         "hash": key,
-        "name": t.get("name") or "",
-        "state": t.get("state") or "",
-        "progress": t.get("progress") or 0,
-        "dlSpeed": t.get("dlspeed") if t.get("dlspeed") is not None else t.get("dlSpeed") or 0,
-        "upSpeed": t.get("upspeed") if t.get("upspeed") is not None else t.get("upSpeed") or 0,
-        "eta": t.get("eta") or 0,
-        "ratio": t.get("ratio") or 0,
-        "size": t.get("size") or 0,
-        "savePath": t.get("save_path") or "",
-        "contentPath": t.get("content_path") or "",
-        "numSeeds": t.get("num_seeds") or 0,
-        "numLeechs": t.get("num_leechs") or 0,
-        "addedOn": t.get("added_on") or 0,
-        "dlLimit": t.get("dl_limit") or 0,
-        "upLimit": t.get("up_limit") or 0,
-        "seqDl": t.get("seq_dl") is True,
-        "ratioLimit": -2 if t.get("ratio_limit") is None else t.get("ratio_limit"),
+        "name": torrent.get("name") or "",
+        "state": torrent.get("state") or "",
+        "progress": torrent.get("progress") or 0,
+        "dlSpeed": torrent.get("dlspeed") if torrent.get("dlspeed") is not None else torrent.get("dlSpeed") or 0,
+        "upSpeed": torrent.get("upspeed") if torrent.get("upspeed") is not None else torrent.get("upSpeed") or 0,
+        "eta": torrent.get("eta") or 0,
+        "ratio": torrent.get("ratio") or 0,
+        "size": torrent.get("size") or 0,
+        "savePath": torrent.get("save_path") or "",
+        "contentPath": torrent.get("content_path") or "",
+        "numSeeds": torrent.get("num_seeds") or 0,
+        "numLeechs": torrent.get("num_leechs") or 0,
+        "addedOn": torrent.get("added_on") or 0,
+        "dlLimit": torrent.get("dl_limit") or 0,
+        "upLimit": torrent.get("up_limit") or 0,
+        "seqDl": torrent.get("seq_dl") is True,
+        "ratioLimit": -2 if torrent.get("ratio_limit") is None else torrent.get("ratio_limit"),
     })
+
+state = {"rid": raw.get("rid") or 0, "torrents": torrents}
+tmp = rid_path.with_name(f".{rid_path.name}.{os.getpid()}.tmp")
+with tmp.open("x") as handle:
+    json.dump(state, handle, separators=(",", ":"))
+os.chmod(tmp, 0o600)
+os.replace(tmp, rid_path)
+server = raw.get("server_state") or {}
 print(json.dumps({
-    "rid": raw.get("rid") or 0,
-    "torrents_map": torrents,
+    "dlSpeed": server.get("dl_info_speed") or 0,
+    "upSpeed": server.get("up_info_speed") or 0,
     "torrents": rows,
-    "dlSpeed": (raw.get("server_state") or {}).get("dl_info_speed") or 0,
-    "upSpeed": (raw.get("server_state") or {}).get("up_info_speed") or 0,
-}))
-' <<<"$raw")
-      printf '%s' "$merged" | jq '{rid, torrents: .torrents_map}' >"$RID_FILE"
-      torrents=$(printf '%s' "$merged" | jq -c '.torrents')
-      dl=$(printf '%s' "$merged" | jq '.dlSpeed')
-      up=$(printf '%s' "$merged" | jq '.upSpeed')
-    fi
+}, separators=(",", ":")))
+PY
+  ); then
+    rm -f "$sync_response"
+    print_status_error "qBittorrent returned an invalid sync response"
+    return 0
   fi
-  if [[ $api == true ]]; then
-    local mode ok_mode
-    set +e
-    mode=$(api GET "/api/v2/transfer/speedLimitsMode")
-    ok_mode=$?
-    set -e
-    if [[ $ok_mode -eq 0 && $mode == 1 ]]; then
-      alt_speed=true
-    fi
+  rm -f "$sync_response"
+
+  local alt_speed=false
+  if api_request GET "/api/v2/transfer/speedLimitsMode" 5; then
+    [[ $(<"$HTTP_BODY_FILE") == 1 ]] && alt_speed=true
+    cleanup_response
   fi
-  # Only ask where the session is bound when a VPN iface is expected; if the
-  # preferences call fails, report both as unknown rather than warn on no data.
-  if [[ $api == true && -n $vpn_if ]]; then
-    local prefs ok_prefs
-    set +e
-    prefs=$(api GET "/api/v2/app/preferences")
-    ok_prefs=$?
-    set -e
-    if [[ $ok_prefs -eq 0 ]]; then
-      bind_if=$(printf '%s' "$prefs" | jq -r '.current_network_interface // ""')
-    else
-      vpn_if=""
-    fi
+  printf '%s' "$merged" | jq --argjson altSpeed "$alt_speed" \
+    '{api:true,error:"",altSpeed:$altSpeed,dlSpeed:(.dlSpeed // 0),upSpeed:(.upSpeed // 0),torrents:(.torrents // [])}'
+}
+
+require_api() {
+  if ! api_request "$@"; then
+    die "$API_ERROR"
   fi
-  jq -n \
-    --argjson installed "$installed" \
-    --argjson daemon "$daemon" \
-    --arg lock "$lock" \
-    --argjson api "$api" \
-    --argjson altSpeed "$alt_speed" \
-    --argjson dl "$dl" \
-    --argjson up "$up" \
-    --argjson torrents "$torrents" \
-    --arg vpnIface "$vpn_if" \
-    --arg bindIface "$bind_if" \
-    '{installed:$installed, daemon:$daemon, lockHolder:$lock, api:$api, altSpeed:$altSpeed, dlSpeed:$dl, upSpeed:$up, torrents:$torrents, vpnIface:$vpnIface, bindIface:$bindIface}'
 }
 
 cmd_add() {
@@ -278,51 +437,54 @@ cmd_add() {
   local path=$target
   [[ $path == file://* ]] && path=${path#file://}
   [[ $path == "~/"* ]] && path=$HOME/${path#\~/}
+  local args=()
   if [[ $path == /* ]]; then
     [[ -f $path ]] || die "no such torrent file: $path"
-    local args=(-F "torrents=@${path}")
-    # qBittorrent 5 reads "stopped"; older builds read "paused". Send both.
+    args=(-F "torrents=@${path}")
     [[ $stopped == true ]] && args+=(-F "stopped=true" -F "paused=true")
     [[ -n $savepath ]] && args+=(-F "savepath=${savepath}")
     [[ -n $category ]] && args+=(-F "category=${category}")
-    api_form POST "/api/v2/torrents/add" "${args[@]}" >/dev/null
   else
-    local body
-    body="urls=$(jq -nr --arg u "$target" '$u|@uri')"
-    [[ $stopped == true ]] && body+="&stopped=true&paused=true"
-    [[ -n $savepath ]] && body+="&savepath=$(jq -nr --arg v "$savepath" '$v|@uri')"
-    [[ -n $category ]] && body+="&category=$(jq -nr --arg v "$category" '$v|@uri')"
-    api POST "/api/v2/torrents/add" "$body" >/dev/null
+    args=(-H "Content-Type: application/x-www-form-urlencoded" --data-urlencode "urls=$target")
+    [[ $stopped == true ]] && args+=(--data-urlencode "stopped=true" --data-urlencode "paused=true")
+    [[ -n $savepath ]] && args+=(--data-urlencode "savepath=$savepath")
+    [[ -n $category ]] && args+=(--data-urlencode "category=$category")
   fi
+  require_api POST "/api/v2/torrents/add" 30 "${args[@]}"
+  cleanup_response
   printf '%s\n' '{"ok":true}'
 }
 
 cmd_start() {
   local hash=${1:-}
   [[ -n $hash ]] || die "usage: qbt start <hash|all>"
-  api POST "/api/v2/torrents/start" "hashes=${hash}" >/dev/null
+  require_api POST "/api/v2/torrents/start" 15 --data-urlencode "hashes=$hash"
+  cleanup_response
   printf '%s\n' '{"ok":true}'
 }
 
 cmd_stop() {
   local hash=${1:-}
   [[ -n $hash ]] || die "usage: qbt stop <hash|all>"
-  api POST "/api/v2/torrents/stop" "hashes=${hash}" >/dev/null
+  require_api POST "/api/v2/torrents/stop" 15 --data-urlencode "hashes=$hash"
+  cleanup_response
   printf '%s\n' '{"ok":true}'
 }
 
 cmd_delete() {
-  local hash=${1:-}
-  local files=false
+  local hash=${1:-} files=false
   shift || true
-  if [[ ${1:-} == --files ]]; then files=true; fi
+  [[ ${1:-} == --files ]] && files=true
   [[ -n $hash ]] || die "usage: qbt delete <hash> [--files]"
-  api POST "/api/v2/torrents/delete" "hashes=${hash}&deleteFiles=${files}" >/dev/null
+  require_api POST "/api/v2/torrents/delete" 15 \
+    --data-urlencode "hashes=$hash" --data-urlencode "deleteFiles=$files"
+  cleanup_response
   printf '%s\n' '{"ok":true}'
 }
 
 cmd_turtle() {
-  api POST "/api/v2/transfer/toggleSpeedLimitsMode" >/dev/null
+  require_api POST "/api/v2/transfer/toggleSpeedLimitsMode" 15
+  cleanup_response
   printf '%s\n' '{"ok":true}'
 }
 
@@ -331,170 +493,63 @@ cmd_limit() {
   [[ -n $hash && -n $bytes && ( $kind == dl || $kind == up ) ]] || die "usage: qbt limit <hash|all> <dl|up> <bytes-per-sec, 0 = unlimited>"
   local endpoint=setDownloadLimit
   [[ $kind == up ]] && endpoint=setUploadLimit
-  api POST "/api/v2/torrents/${endpoint}" "hashes=${hash}&limit=${bytes}" >/dev/null
+  require_api POST "/api/v2/torrents/$endpoint" 15 \
+    --data-urlencode "hashes=$hash" --data-urlencode "limit=$bytes"
+  cleanup_response
   printf '%s\n' '{"ok":true}'
 }
 
 cmd_sequential() {
   local hash=${1:-}
   [[ -n $hash ]] || die "usage: qbt sequential <hash>"
-  api POST "/api/v2/torrents/toggleSequentialDownload" "hashes=${hash}" >/dev/null
+  require_api POST "/api/v2/torrents/toggleSequentialDownload" 15 --data-urlencode "hashes=$hash"
+  cleanup_response
   printf '%s\n' '{"ok":true}'
 }
 
 cmd_sharelimit() {
   local hash=${1:-} ratio=${2:-}
   [[ -n $hash && -n $ratio ]] || die "usage: qbt sharelimit <hash> <ratio, -2 = global, -1 = none>"
-  api POST "/api/v2/torrents/setShareLimits" "hashes=${hash}&ratioLimit=${ratio}&seedingTimeLimit=-2&inactiveSeedingTimeLimit=-2" >/dev/null
+  require_api POST "/api/v2/torrents/setShareLimits" 15 \
+    --data-urlencode "hashes=$hash" \
+    --data-urlencode "ratioLimit=$ratio" \
+    --data-urlencode "seedingTimeLimit=-2" \
+    --data-urlencode "inactiveSeedingTimeLimit=-2"
+  cleanup_response
   printf '%s\n' '{"ok":true}'
 }
 
 cmd_files() {
   local hash=${1:-}
   [[ -n $hash ]] || die "usage: qbt files <hash>"
-  api GET "/api/v2/torrents/files?hash=${hash}"
+  require_api GET "/api/v2/torrents/files?hash=$hash" 15
+  cat "$HTTP_BODY_FILE"
   printf '\n'
+  cleanup_response
 }
 
 cmd_prio() {
   local hash=${1:-} index=${2:-} prio=${3:-}
   [[ -n $hash && -n $index && -n $prio ]] || die "usage: qbt prio <hash> <index> <0|1|6|7>"
-  api POST "/api/v2/torrents/filePrio" "hash=${hash}&id=${index}&priority=${prio}" >/dev/null
+  require_api POST "/api/v2/torrents/filePrio" 15 \
+    --data-urlencode "hash=$hash" --data-urlencode "id=$index" --data-urlencode "priority=$prio"
+  cleanup_response
   printf '%s\n' '{"ok":true}'
 }
 
-set_key() {
-  local file=$1 key=$2 value=$3
-  local section=${4:-Preferences}
-  mkdir -p "$(dirname "$file")"
-  touch "$file"
-  python3 - "$file" "$key" "$value" "$section" <<'PY'
-import sys
-from pathlib import Path
-
-path, key, value, section = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
-header = "[" + section + "]"
-lines = path.read_text().splitlines() if path.exists() else []
-lines = [ln for ln in lines if not ln.startswith(key + "=")]
-out = []
-inserted = False
-if not any(ln.strip() == header for ln in lines):
-    if lines and lines[-1].strip() != "":
-        lines.append("")
-    lines.append(header)
-for ln in lines:
-    out.append(ln)
-    if ln.strip() == header and not inserted:
-        out.append(f"{key}={value}")
-        inserted = True
-if not inserted:
-    out.append(header)
-    out.append(f"{key}={value}")
-path.write_text("\n".join(out) + "\n")
-PY
-}
-
-bind_mullvad() {
-  local iface
-  iface=$(vpn_iface)
-  [[ -n $iface ]] || return 0
-  # Bind the tunnel interface, not a relay IP, so a city change keeps working.
-  set_key "$CONF" 'Session\Interface' "$iface" BitTorrent
-  set_key "$CONF" 'Session\InterfaceName' "$iface" BitTorrent
-  set_key "$CONF" 'Session\InterfaceAddress' "" BitTorrent
-}
-
-ensure_port() {
-  local port=8080
-  if grep -F -q 'WebUI\Port=' "$CONF" 2>/dev/null; then
-    port=$(grep -F 'WebUI\Port=' "$CONF" | tail -n1 | cut -d= -f2)
-    [[ -n $port ]] || port=8080
-  fi
-  set_key "$CONF" 'WebUI\Port' "$port"
-}
-
-write_unit() {
-  mkdir -p "$UNIT_DIR"
-  if [[ -f $UNIT_FILE ]]; then
-    return
-  fi
-  cat >"$UNIT_FILE" <<'UNIT'
-[Unit]
-Description=qBittorrent-nox for OmaqBT
-After=network-online.target
-
-[Service]
-ExecStart=/usr/bin/qbittorrent-nox
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-UNIT
-}
-
-cmd_install() {
-  # Panel Process has no TTY, so sudo cannot prompt. pkexec opens the
-  # same polkit dialog Tailscale uses. A real terminal can use sudo.
-  if [[ -t 0 ]]; then
-    omarchy pkg add qbittorrent-nox
-  else
-    pkexec omarchy pkg add qbittorrent-nox
-  fi
-  printf '%s\n' '{"ok":true}'
-}
-
-cmd_start_daemon() {
-  local lock
-  lock=$(lock_holder)
-  if [[ $lock == gui ]]; then
-    die "Close qBittorrent before starting the daemon."
-  fi
-  # A running nox rewrites qBittorrent.conf from memory on exit, so
-  # write the WebUI keys only while it is stopped.
-  if [[ ${QBT_SKIP_SYSTEMCTL:-} != 1 ]] && is_daemon; then
-    systemctl --user stop omaqbt-nox.service || true
-    local i
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-      is_daemon || break
-      sleep 0.2
-    done
-  fi
-  write_unit
-  set_key "$CONF" 'WebUI\Enabled' 'true'
-  set_key "$CONF" 'WebUI\Address' '127.0.0.1'
-  set_key "$CONF" 'WebUI\LocalHostAuth' 'false'
-  set_key "$CONF" 'WebUI\AuthSubnetWhitelistEnabled' 'true'
-  set_key "$CONF" 'WebUI\AuthSubnetWhitelist' '127.0.0.1, ::1'
-  ensure_port
-  bind_mullvad
-  if [[ ${QBT_SKIP_SYSTEMCTL:-} != 1 ]]; then
-    systemctl --user daemon-reload
-    systemctl --user enable --now omaqbt-nox.service
-  fi
-  printf '%s\n' '{"ok":true}'
-}
-
-cmd_stop_daemon() {
-  if [[ ${QBT_SKIP_SYSTEMCTL:-} != 1 ]]; then
-    systemctl --user stop omaqbt-nox.service
-  fi
-  printf '%s\n' '{"ok":true}'
-}
-
-case ${1:-} in
-  status) shift; cmd_status "$@" ;;
-  add) shift; cmd_add "$@" ;;
-  start) shift; cmd_start "$@" ;;
-  stop) shift; cmd_stop "$@" ;;
-  delete) shift; cmd_delete "$@" ;;
-  files) shift; cmd_files "$@" ;;
-  prio) shift; cmd_prio "$@" ;;
-  turtle) shift; cmd_turtle "$@" ;;
-  limit) shift; cmd_limit "$@" ;;
-  sequential) shift; cmd_sequential "$@" ;;
-  sharelimit) shift; cmd_sharelimit "$@" ;;
-  install) shift; cmd_install "$@" ;;
-  start-daemon) shift; cmd_start_daemon "$@" ;;
-  stop-daemon) shift; cmd_stop_daemon "$@" ;;
-  *) die "usage: qbt status|add|start|stop|delete|files|prio|turtle|limit|sequential|sharelimit|install|start-daemon|stop-daemon" ;;
+command_name=${1:-}
+shift || true
+case $command_name in
+  status) cmd_status "$@" ;;
+  add) cmd_add "$@" ;;
+  start) cmd_start "$@" ;;
+  stop) cmd_stop "$@" ;;
+  delete) cmd_delete "$@" ;;
+  files) cmd_files "$@" ;;
+  prio) cmd_prio "$@" ;;
+  turtle) cmd_turtle "$@" ;;
+  limit) cmd_limit "$@" ;;
+  sequential) cmd_sequential "$@" ;;
+  sharelimit) cmd_sharelimit "$@" ;;
+  *) die "usage: qbt [--base-url <url>] [--username <name>] status|add|start|stop|delete|files|prio|turtle|limit|sequential|sharelimit" ;;
 esac

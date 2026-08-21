@@ -147,12 +147,11 @@ test("priorityLabel and cycle walk Skip Low Normal High", () => {
   assert.equal(Model.cyclePriority(7), 0);
 });
 
-test("parseStatusJson reads helper snapshot and assigns torrentId", () => {
+test("parseStatusJson reads the remote helper snapshot and assigns torrentId", () => {
   const status = Model.parseStatusJson(JSON.stringify({
-    installed: true,
-    daemon: true,
-    lockHolder: "nox",
     api: true,
+    error: "",
+    altSpeed: false,
     dlSpeed: 10,
     upSpeed: 2,
     torrents: [
@@ -160,75 +159,83 @@ test("parseStatusJson reads helper snapshot and assigns torrentId", () => {
     ]
   }));
   assert.equal(status.ok, true);
-  assert.equal(status.installed, true);
+  assert.equal(status.api, true);
+  assert.equal(status.dlSpeed, 10);
   assert.equal(status.torrents[0].hash, "deadbeef");
   assert.equal(status.torrents[0].bucket, "downloading");
 });
 
-test("parseStatusJson returns not-ok for garbage", () => {
+test("parseStatusJson returns a closed empty status for garbage", () => {
   const status = Model.parseStatusJson("nope");
   assert.equal(status.ok, false);
-  assert.equal(status.installed, false);
+  assert.equal(status.api, false);
+  assert.equal(status.dlSpeed, 0);
   assert.deepEqual(status.torrents, []);
 });
 
-test("sanitizeError strips SID cookies and password fields", () => {
-  const cleaned = Model.sanitizeError("fail SID=abc+def/12; password=secret leftover");
-  assert.equal(/SID=/i.test(cleaned), false);
-  assert.equal(/password=secret/i.test(cleaned), false);
-  assert.match(cleaned, /fail/);
-  assert.match(cleaned, /leftover/);
+test("parseStatusJson clears endpoint data when api is false", () => {
+  const status = Model.parseStatusJson(JSON.stringify({
+    api: false,
+    error: "connection refused",
+    altSpeed: true,
+    dlSpeed: 99,
+    upSpeed: 88,
+    torrents: [{ hash: "stale", name: "stale" }]
+  }));
+  assert.equal(status.api, false);
+  assert.equal(status.altSpeed, false);
+  assert.equal(status.dlSpeed, 0);
+  assert.equal(status.upSpeed, 0);
+  assert.deepEqual(status.torrents, []);
+  assert.equal(status.error, "connection refused");
 });
 
-test("nextStatusError keeps a previous install error when still not installed", () => {
+test("sanitizeError strips cookies, login fields, SID values, and rich-text markers", () => {
+  const cleaned = Model.sanitizeError(
+    "fail Cookie: SID=abc+def/12\nSet-Cookie: SID=other; HttpOnly\nusername=admin&password=secret <img src=x>"
+  );
+  assert.equal(/SID=/i.test(cleaned), false);
+  assert.equal(/Cookie:/i.test(cleaned), false);
+  assert.equal(/username=admin/i.test(cleaned), false);
+  assert.equal(/password=secret/i.test(cleaned), false);
+  assert.equal(/[<>]/.test(cleaned), false);
+  assert.match(cleaned, /fail/);
+});
+
+test("nextStatusError keeps a sanitized prior error while unavailable", () => {
   const parsed = Model.parseStatusJson(JSON.stringify({
-    installed: false,
-    daemon: false,
-    lockHolder: "none",
     api: false,
+    error: "",
+    altSpeed: false,
     dlSpeed: 0,
     upSpeed: 0,
     torrents: []
   }));
-  assert.equal(
-    Model.nextStatusError(parsed, "sudo: a password is required"),
-    "sudo: a password is required"
-  );
+  assert.equal(Model.nextStatusError(parsed, "<b>offline</b>"), "boffline/b");
 });
 
-test("nextStatusError uses parsed.error when present", () => {
+test("nextStatusError uses the helper connection error", () => {
   const parsed = Model.parseStatusJson(JSON.stringify({
-    installed: false,
-    daemon: false,
-    lockHolder: "none",
     api: false,
+    error: "HTTP 403",
+    altSpeed: false,
     dlSpeed: 0,
     upSpeed: 0,
-    torrents: [],
-    error: "HTTP 403"
+    torrents: []
   }));
   assert.equal(Model.nextStatusError(parsed, "old"), "HTTP 403");
 });
 
-test("nextStatusError clears when the daemon is ready", () => {
+test("nextStatusError clears after a successful API session", () => {
   const parsed = Model.parseStatusJson(JSON.stringify({
-    installed: true,
-    daemon: true,
-    lockHolder: "nox",
     api: true,
+    error: "",
+    altSpeed: false,
     dlSpeed: 0,
     upSpeed: 0,
     torrents: []
   }));
   assert.equal(Model.nextStatusError(parsed, "old"), "");
-});
-
-test("installCommand uses pkexec when there is no tty", () => {
-  assert.deepEqual(Model.installCommand(false), ["pkexec", "omarchy", "pkg", "add", "qbittorrent-nox"]);
-});
-
-test("installCommand uses omarchy pkg add on a tty", () => {
-  assert.deepEqual(Model.installCommand(true), ["omarchy", "pkg", "add", "qbittorrent-nox"]);
 });
 
 
@@ -284,41 +291,10 @@ test("completionText names one finisher and counts many", () => {
   assert.equal(Model.completionText(["a", "b", "c"]), "3 torrents finished downloading");
 });
 
-test("parseStatusJson carries vpnIface and bindIface", () => {
-  const parsed = Model.parseStatusJson(JSON.stringify({
-    installed: true,
-    daemon: true,
-    lockHolder: "nox",
-    api: true,
-    dlSpeed: 0,
-    upSpeed: 0,
-    torrents: [],
-    vpnIface: "wg0-mullvad",
-    bindIface: ""
-  }));
-  assert.equal(parsed.vpnIface, "wg0-mullvad");
-  assert.equal(parsed.bindIface, "");
-});
-
-test("parseStatusJson defaults missing iface fields to empty strings", () => {
-  const parsed = Model.parseStatusJson(JSON.stringify({ installed: true, daemon: true, api: true, torrents: [] }));
-  assert.equal(parsed.vpnIface, "");
-  assert.equal(parsed.bindIface, "");
-});
-
-test("vpnUnbound warns only when the daemon runs off the VPN while it is up", () => {
-  const base = { daemon: true, api: true, vpnIface: "wg0-mullvad", bindIface: "" };
-  assert.equal(Model.vpnUnbound(base), true);
-  assert.equal(Model.vpnUnbound({ ...base, bindIface: "wg0-mullvad" }), false);
-  assert.equal(Model.vpnUnbound({ ...base, vpnIface: "" }), false);
-  assert.equal(Model.vpnUnbound({ ...base, daemon: false }), false);
-  assert.equal(Model.vpnUnbound({ ...base, api: false }), false);
-  assert.equal(Model.vpnUnbound(null), false);
-});
 
 test("parseStatusJson maps detail fields with safe defaults", () => {
   const parsed = Model.parseStatusJson(JSON.stringify({
-    installed: true, daemon: true, api: true,
+    api: true,
     torrents: [
       {
         hash: "a", name: "x", state: "downloading", progress: 0.5,
@@ -430,7 +406,7 @@ test("listQuery treats local torrent files as no filter", () => {
 
 test("parseStatusJson carries altSpeed and per-torrent limit fields", () => {
   const parsed = Model.parseStatusJson(JSON.stringify({
-    installed: true, daemon: true, api: true, altSpeed: true,
+    api: true, altSpeed: true,
     torrents: [
       { hash: "a", name: "x", state: "downloading", progress: 0.5, dlLimit: 1048576, upLimit: 0, seqDl: true, ratioLimit: -2 },
       { hash: "b", name: "y", state: "uploading", progress: 1 }
@@ -447,7 +423,7 @@ test("parseStatusJson carries altSpeed and per-torrent limit fields", () => {
 });
 
 test("parseStatusJson defaults altSpeed to false", () => {
-  const parsed = Model.parseStatusJson(JSON.stringify({ installed: true, torrents: [] }));
+  const parsed = Model.parseStatusJson(JSON.stringify({ api: true, torrents: [] }));
   assert.equal(parsed.altSpeed, false);
 });
 

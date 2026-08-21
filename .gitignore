@@ -6,3 +6,5 @@ tests/fixtures/.requests.json
 tests/fixtures/.rid
 
 tests/fixtures/.bind
+
+.omp/

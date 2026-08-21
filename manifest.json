@@ -1,25 +1,39 @@
 {
   "schemaVersion": 1,
-  "id": "aweiward.omaqbt",
+  "id": "omaqbt.remote",
   "name": "OmaqBT",
   "version": "1.0.0",
-  "author": "Aweiward",
+  "author": "OmaqBT maintainers",
   "license": "MIT",
-  "description": "OmaqBT: transfers, magnets, start/stop, remove, and file priorities in the Omarchy bar.",
+  "description": "OmaqBT: remotely control qBittorrent transfers through its Web API.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
   "barWidget": {
     "displayName": "OmaqBT",
-    "description": "Watch transfers, add magnets, start or stop, remove, and set file priorities.",
+    "description": "Watch and control transfers on a local or remote qBittorrent Web API.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
+      "baseUrl": "http://127.0.0.1:8080",
+      "username": "",
       "refreshIntervalSec": 5
     },
     "schema": [
+      {
+        "key": "baseUrl",
+        "type": "string",
+        "label": "qBittorrent Web API URL",
+        "defaultValue": "http://127.0.0.1:8080"
+      },
+      {
+        "key": "username",
+        "type": "string",
+        "label": "qBittorrent username",
+        "defaultValue": ""
+      },
       {
         "key": "refreshIntervalSec",
         "type": "integer",
